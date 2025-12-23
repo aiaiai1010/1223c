@@ -234,29 +234,35 @@
             <p>正しい姿勢を保ちましょう</p>
         </div>
 
+        <div class="youtube-input" style="padding: 15px; background: #f7f7f7;">
+            <input type="text" id="youtubeUrl" placeholder="YouTubeのURLを入力してください" style="width: 70%; padding: 10px; border: 2px solid #667eea; border-radius: 5px; font-size: 14px;">
+            <button onclick="loadYouTube()" style="padding: 10px 20px; margin-left: 5px;">動画を読み込む</button>
+        </div>
+
         <div class="video-container">
             <video id="video" autoplay playsinline></video>
             <canvas id="canvas"></canvas>
+            <div id="youtubePlayer" style="display: none; width: 100%; aspect-ratio: 16/9;"></div>
         </div>
 
         <div class="info-panel">
             <div class="angle-display" id="angleDisplay">
                 <div class="angle-value" id="angleValue">--°</div>
-                <div class="angle-label">顔の下向き角度</div>
+                <div class="angle-label">顔の傾き（左右）</div>
             </div>
 
             <div class="warning-message" id="warningMessage">
-                <strong>⚠️ 警告:</strong> 顔が30度以上下を向いています。姿勢を正してください。
+                <strong>⚠️ 警告:</strong> 顔が15度以上傾いています。姿勢を正してください。
             </div>
 
             <div class="metrics">
                 <div class="metric-card">
                     <div class="metric-value" id="faceAngle">--°</div>
-                    <div class="metric-label">顔の傾き</div>
+                    <div class="metric-label">生の顔の傾き</div>
                 </div>
                 <div class="metric-card">
-                    <div class="metric-value" id="deviceAngle">--°</div>
-                    <div class="metric-label">デバイスの傾き</div>
+                    <div class="metric-value" id="calibrationOffset">0°</div>
+                    <div class="metric-label">キャリブレーション補正値</div>
                 </div>
             </div>
 
@@ -267,15 +273,17 @@
             <div class="controls">
                 <button id="startBtn" onclick="startDetection()">開始</button>
                 <button id="stopBtn" onclick="stopDetection()" disabled>停止</button>
+                <button id="calibrateBtn" onclick="calibrate()" disabled>キャリブレーション</button>
             </div>
 
             <div class="tips">
                 <h3>💡 使い方</h3>
                 <ul>
-                    <li>スマホのカメラとモーションセンサーへのアクセスを許可してください</li>
-                    <li>前面カメラで顔を映してください</li>
-                    <li>顔が30度以上下を向くと警告が表示されます</li>
-                    <li>デバイスを傾けた場合も正確に顔の向きを計算します</li>
+                    <li>YouTubeのURLを入力すると動画が再生されます</li>
+                    <li>「開始」ボタンで顔の傾き検出を開始します</li>
+                    <li>正しい姿勢で「キャリブレーション」ボタンを押すと現在の姿勢が基準になります</li>
+                    <li>顔が15度以上傾くと警告が表示されます</li>
+                    <li>動画を見ながら姿勢をチェックできます</li>
                 </ul>
             </div>
         </div>
@@ -285,6 +293,7 @@
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+    <script src="https://www.youtube.com/iframe_api"></script>
 
     <script>
         // グローバル変数
@@ -294,6 +303,8 @@
         let isRunning = false;
         let lastFaceAngle = 0;
         let smoothedFaceAngle = 0;
+        let calibrationOffset = 0;
+        let youtubePlayer = null;
         const SMOOTHING_FACTOR = 0.3;
 
         // MediaPipe Face Meshのセットアップ
@@ -337,18 +348,18 @@
                 drawConnectors(canvasCtx, landmarks, FACEMESH_LEFT_EYE, { color: '#30FF30' });
                 drawConnectors(canvasCtx, landmarks, FACEMESH_FACE_OVAL, { color: '#E0E0E0' });
 
-                // 顔の角度を計算
-                const faceAngle = calculateFaceAngle(landmarks);
-                lastFaceAngle = faceAngle;
+                // 顔の角度を計算（ロール - 左右の傾き）
+                const rawRollAngle = calculateFaceAngle(landmarks);
+                lastFaceAngle = rawRollAngle;
 
-                // 顔の向き（下向き角度）を計算
-                const faceDirection = calculateFaceDirection(faceAngle, deviceOrientation);
+                // キャリブレーションを適用
+                const calibratedAngle = calculateCalibratedAngle(rawRollAngle);
 
                 // 平滑化
-                smoothedFaceAngle = smoothedFaceAngle * (1 - SMOOTHING_FACTOR) + faceDirection * SMOOTHING_FACTOR;
+                smoothedFaceAngle = smoothedFaceAngle * (1 - SMOOTHING_FACTOR) + calibratedAngle * SMOOTHING_FACTOR;
 
                 // UIを更新
-                updateUI(smoothedFaceAngle, faceAngle, deviceOrientation.beta);
+                updateUI(smoothedFaceAngle, rawRollAngle, calibrationOffset);
 
                 // 重要なポイントを描画
                 drawKeyPoints(canvasCtx, landmarks, canvasElement.width, canvasElement.height);
@@ -357,68 +368,57 @@
             canvasCtx.restore();
         }
 
-        // 顔の角度を計算（ピッチ角度 - 上下の傾き）
+        // 顔の傾き（ロール角度 - 左右の傾き）を計算
         function calculateFaceAngle(landmarks) {
-            // 鼻の先端 (index 1)
-            const noseTip = landmarks[1];
+            // 左目の外側 (index 33)
+            const leftEyeOuter = landmarks[33];
 
-            // 鼻の付け根 (index 168)
-            const noseBridge = landmarks[168];
+            // 右目の外側 (index 263)
+            const rightEyeOuter = landmarks[263];
 
-            // 顎の先 (index 152)
-            const chin = landmarks[152];
+            // 左目の内側 (index 133)
+            const leftEyeInner = landmarks[133];
 
-            // 額の中心 (index 10)
-            const forehead = landmarks[10];
+            // 右目の内側 (index 362)
+            const rightEyeInner = landmarks[362];
 
-            // 顔の中心線のベクトル（額から顎へ）
-            const faceVectorY = chin.y - forehead.y;
-            const faceVectorZ = chin.z - forehead.z;
+            // 両目の中心を計算
+            const leftEyeCenter = {
+                x: (leftEyeOuter.x + leftEyeInner.x) / 2,
+                y: (leftEyeOuter.y + leftEyeInner.y) / 2
+            };
 
-            // ピッチ角度を計算（前後の傾き）
-            let pitchAngle = Math.atan2(faceVectorZ, faceVectorY) * (180 / Math.PI);
+            const rightEyeCenter = {
+                x: (rightEyeOuter.x + rightEyeInner.x) / 2,
+                y: (rightEyeOuter.y + rightEyeInner.y) / 2
+            };
 
-            // 角度を調整（下を向くとプラス）
-            pitchAngle = -pitchAngle;
+            // 目の位置から傾き角度を計算
+            const deltaY = rightEyeCenter.y - leftEyeCenter.y;
+            const deltaX = rightEyeCenter.x - leftEyeCenter.x;
 
-            // 鼻のベクトルも使用してより正確に
-            const noseVectorY = noseTip.y - noseBridge.y;
-            const noseVectorZ = noseTip.z - noseBridge.z;
-            let noseAngle = Math.atan2(noseVectorZ, noseVectorY) * (180 / Math.PI);
-            noseAngle = -noseAngle;
+            // アークタンジェントで角度を計算（ラジアンから度に変換）
+            let rollAngle = Math.atan2(deltaY, deltaX) * (180 / Math.PI);
 
-            // 2つの角度を平均
-            const avgAngle = (pitchAngle + noseAngle) / 2;
+            // 角度を正規化（右に傾くとプラス、左に傾くとマイナス）
+            rollAngle = -rollAngle;
 
-            return avgAngle;
+            return rollAngle;
         }
 
-        // 実際の顔の向き（下向き角度）を計算
-        function calculateFaceDirection(faceAngle, deviceOrientation) {
-            // デバイスのベータ角度（前後の傾き）
-            // beta: 90 = デバイスが立っている, 0 = デバイスが平面
-            let deviceTilt = deviceOrientation.beta || 0;
-
-            // デバイスが立っている状態(90度)を基準にする
-            // デバイスが前に傾くほど、顔の下向き角度も増える
-            let deviceAngleContribution = 90 - deviceTilt;
-
-            // 実際の顔の向き = 顔の下向き角度 + デバイスの前傾角度
-            let faceDirection = faceAngle + deviceAngleContribution;
-
-            // 0度を基準に正規化（まっすぐ前を見ている状態が0度）
-            faceDirection = Math.max(0, faceDirection);
-
-            return faceDirection;
+        // キャリブレーションを考慮した顔の傾きを計算
+        function calculateCalibratedAngle(rawAngle) {
+            // キャリブレーションオフセットを適用
+            return rawAngle - calibrationOffset;
         }
 
         // 重要なポイントを描画
         function drawKeyPoints(ctx, landmarks, width, height) {
             const keyPoints = [
-                { index: 1, color: '#FF0000', label: '鼻先' },
-                { index: 168, color: '#00FF00', label: '鼻付け根' },
-                { index: 10, color: '#0000FF', label: '額' },
-                { index: 152, color: '#FFFF00', label: '顎' }
+                { index: 33, color: '#FF0000', label: '左目外側' },
+                { index: 263, color: '#00FF00', label: '右目外側' },
+                { index: 133, color: '#0000FF', label: '左目内側' },
+                { index: 362, color: '#FFFF00', label: '右目内側' }
             ];
 
             keyPoints.forEach(point => {
@@ -434,19 +434,19 @@
         }
 
         // UIを更新
-        function updateUI(faceDirectionAngle, facePitchAngle, deviceBeta) {
+        function updateUI(calibratedAngle, rawAngle, calibOffset) {
             const angleValue = document.getElementById('angleValue');
             const faceAngleEl = document.getElementById('faceAngle');
-            const deviceAngleEl = document.getElementById('deviceAngle');
+            const calibrationOffsetEl = document.getElementById('calibrationOffset');
             const angleDisplay = document.getElementById('angleDisplay');
             const warningMessage = document.getElementById('warningMessage');
 
-            angleValue.textContent = Math.round(faceDirectionAngle) + '°';
-            faceAngleEl.textContent = Math.round(facePitchAngle) + '°';
-            deviceAngleEl.textContent = Math.round(90 - (deviceBeta || 90)) + '°';
+            angleValue.textContent = Math.round(calibratedAngle) + '°';
+            faceAngleEl.textContent = Math.round(rawAngle) + '°';
+            calibrationOffsetEl.textContent = Math.round(calibOffset) + '°';
 
-            // 30度以上で警告
-            if (faceDirectionAngle >= 30) {
+            // 絶対値15度以上で警告
+            if (Math.abs(calibratedAngle) >= 15) {
                 angleDisplay.classList.add('warning');
                 warningMessage.classList.add('active');
             } else {
@@ -555,6 +555,7 @@
                 document.getElementById('status').textContent = '検出中... 顔をカメラに向けてください';
                 document.getElementById('status').classList.remove('error');
                 document.getElementById('stopBtn').disabled = false;
+                document.getElementById('calibrateBtn').disabled = false;
             } catch (error) {
                 console.error('Error starting detection:', error);
                 document.getElementById('status').textContent = 'エラー: ' + error.message;
@@ -580,6 +581,89 @@
             document.getElementById('status').textContent = '停止しました';
             document.getElementById('startBtn').disabled = false;
             document.getElementById('stopBtn').disabled = true;
+            document.getElementById('calibrateBtn').disabled = true;
+        }
+
+        // キャリブレーション
+        function calibrate() {
+            if (!isRunning) {
+                alert('先に「開始」ボタンを押してください');
+                return;
+            }
+
+            // 現在の生の角度をオフセットとして保存
+            calibrationOffset = lastFaceAngle;
+            smoothedFaceAngle = 0;
+
+            document.getElementById('status').textContent = 'キャリブレーション完了！現在の姿勢が基準になりました。';
+
+            // 3秒後にステータスをリセット
+            setTimeout(() => {
+                if (isRunning) {
+                    document.getElementById('status').textContent = '検出中... 顔をカメラに向けてください';
+                }
+            }, 3000);
+        }
+
+        // YouTube動画を読み込む
+        function loadYouTube() {
+            const url = document.getElementById('youtubeUrl').value.trim();
+            if (!url) {
+                alert('YouTubeのURLを入力してください');
+                return;
+            }
+
+            // URLからビデオIDを抽出
+            let videoId = '';
+
+            // youtube.com/watch?v=VIDEO_ID 形式
+            let match = url.match(/[?&]v=([^&]+)/);
+            if (match) {
+                videoId = match[1];
+            }
+
+            // youtu.be/VIDEO_ID 形式
+            if (!videoId) {
+                match = url.match(/youtu\.be\/([^?]+)/);
+                if (match) {
+                    videoId = match[1];
+                }
+            }
+
+            // youtube.com/embed/VIDEO_ID 形式
+            if (!videoId) {
+                match = url.match(/youtube\.com\/embed\/([^?]+)/);
+                if (match) {
+                    videoId = match[1];
+                }
+            }
+
+            if (!videoId) {
+                alert('正しいYouTubeのURLを入力してください');
+                return;
+            }
+
+            // YouTube Playerを表示
+            document.getElementById('video').style.display = 'none';
+            document.getElementById('canvas').style.display = 'none';
+            document.getElementById('youtubePlayer').style.display = 'block';
+
+            // 既存のプレイヤーを削除
+            if (youtubePlayer) {
+                youtubePlayer.destroy();
+            }
+
+            // 新しいプレイヤーを作成
+            youtubePlayer = new YT.Player('youtubePlayer', {
+                videoId: videoId,
+                width: '100%',
+                height: '100%',
+                playerVars: {
+                    autoplay: 1,
+                    controls: 1,
+                    modestbranding: 1
+                }
+            });
         }
 
         // ページ読み込み時
